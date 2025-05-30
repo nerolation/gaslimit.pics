@@ -131,7 +131,11 @@ for ix, i in df.iterrows():
         if int(i["proposer_index"]) in reg_keys and reg[int(i["proposer_index"])] >= 36_000_000 and last_update[int(i["proposer_index"])] >= int(i["slot"]):
             df.loc[ix, "execution_payload_gas_limit_adj"] = 36_000_000
         else:
-            df.loc[ix, "execution_payload_gas_limit_adj"] = 30_000_000    
+            # drop from >36m to something still above 35_999_999. Validator not registered at relay with value higher than 36m
+            if curr_value >= 36_000_000 and last_value > 36_000_000 and last_value > curr_value:
+                df.loc[ix, "execution_payload_gas_limit_adj"] = 36_000_000    
+            else:
+                df.loc[ix, "execution_payload_gas_limit_adj"] = 30_000_000    
     
     last_value = curr_value    
     #last_slot = slot
