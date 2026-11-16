@@ -1,0 +1,10 @@
+# secrets — never commit
+.pyxatu_config.json
+rpc.txt
+AGENTS.md
+# local env / caches
+.venv/
+*.parquet
+__pycache__/
+.ipynb_checkpoints/
+update.log
