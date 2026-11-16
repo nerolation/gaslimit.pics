@@ -28,6 +28,10 @@ def query(sql):
     return pd.read_csv(StringIO(r.text), sep="\t")
 
 
+THRESHOLD = 60_000_000  # current mainnet gas limit; signals are "below" vs ">= this"
+LOW, HIGH = 0, 1         # bucket ids for execution_payload_gas_limit_adj
+LOW_NAME, HIGH_NAME = f"<{THRESHOLD // 10**6}M", f">={THRESHOLD // 10**6}M"
+
 color_palette = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2",
     "#7f7f7f", "#bcbd22", "#17becf", "#aec7e8", "#ffbb78", "#98df8a", "#ff9896",
@@ -86,21 +90,24 @@ df = query(f"""
 """).dropna(subset=["execution_payload_gas_limit"])
 df["execution_payload_gas_limit"] = df["execution_payload_gas_limit"].astype("int64")
 
-# Classify each block as "raised the limit" (60M bucket) or not (45M bucket).
-# Above 45M: a block is a 60M signal iff it raised the limit vs its parent.
-# At/below 45M: a raise also counts, unless the proposer's registration asks < 60M.
+# Infer each proposer's gas limit target from the block-to-block change.
+# Clients move the limit by at most parent//1024 - 1 per block, so:
+#   full step down          -> target < new value   -> signals below THRESHOLD
+#   full step up            -> target > new value   -> signals >= THRESHOLD
+#   unchanged / partial step -> target == new value -> compare to THRESHOLD
 curr = df["execution_payload_gas_limit"]
-prev = curr.shift(1, fill_value=30_000_000)
-reg_wanted = df["proposer_index"].map(reg)
-raised = curr > prev
-ok_registration = reg_wanted.isna() | (reg_wanted >= 60_000_000)
-df["execution_payload_gas_limit_adj"] = 45_000_000
-df.loc[raised & ((prev > 45_000_000) | ok_registration), "execution_payload_gas_limit_adj"] = 60_000_000
+prev = curr.shift(1)
+max_step = prev // 1024 - 1
+delta = curr - prev
+below = (delta == -max_step) | ((delta.abs() < max_step) & (curr < THRESHOLD))
+df = df[prev.notna()].copy()  # first block has no parent in the window
+df["execution_payload_gas_limit_adj"] = LOW
+df.loc[~below[df.index], "execution_payload_gas_limit_adj"] = HIGH
 
 dfg = df.groupby(["date", "execution_payload_gas_limit_adj"])["slot"].nunique().reset_index()
 dfg["signal_per"] = dfg["slot"] / dfg.groupby("date")["slot"].transform("sum") * 100
 pivoted = dfg.pivot(index="date", columns="execution_payload_gas_limit_adj", values="signal_per")
-pivoted = pivoted.reindex(columns=[45_000_000, 60_000_000], fill_value=0).fillna(0)
+pivoted = pivoted.reindex(columns=[LOW, HIGH], fill_value=0).fillna(0)
 
 # Entity labels (ethseer). "foo_lido" -> "foo (lido)", "solo_stakers" -> "solo stakers".
 labels = query("""
@@ -123,18 +130,18 @@ dfn2 = dfn.copy()
 TOP_N = 40
 order = order[:TOP_N] + ["others"]
 dfn["label"] = dfn["label"].where(dfn["label"].isin(order), "others")
-dfn = dfn[dfn["execution_payload_gas_limit_adj"].isin([45_000_000, 60_000_000])]
+dfn = dfn[dfn["execution_payload_gas_limit_adj"].isin([LOW, HIGH])]
 dfn = dfn.groupby(["date", "label", "execution_payload_gas_limit_adj"])["slot"].nunique().reset_index()
 
 # Per-entity share of blocks that did NOT raise the limit over the last week.
 dfn2["date"] = pd.to_datetime(dfn2["date"])
 dfn2 = dfn2[dfn2["date"] >= dfn2["date"].max() - timedelta(weeks=1)]
-dfn2["gas_limit_45M"] = (dfn2["execution_payload_gas_limit_adj"] == 45_000_000).astype(int)
-dfn2["gas_limit_60M"] = (dfn2["execution_payload_gas_limit_adj"] == 60_000_000).astype(int)
-dfn2 = dfn2.groupby("label")[["gas_limit_45M", "gas_limit_60M"]].sum().reset_index()
-dfn2 = dfn2[dfn2["gas_limit_45M"] + dfn2["gas_limit_60M"] >= 10]  # drop tiny entities
-dfn2["perc"] = dfn2["gas_limit_45M"] / (dfn2["gas_limit_60M"] + dfn2["gas_limit_45M"])
-(dfn2.sort_values(["perc", "gas_limit_60M", "gas_limit_45M"], ascending=False)
+dfn2["blocks_low"] = (dfn2["execution_payload_gas_limit_adj"] == LOW).astype(int)
+dfn2["blocks_high"] = (dfn2["execution_payload_gas_limit_adj"] == HIGH).astype(int)
+dfn2 = dfn2.groupby("label")[["blocks_low", "blocks_high"]].sum().reset_index()
+dfn2 = dfn2[dfn2["blocks_low"] + dfn2["blocks_high"] >= 10]  # drop tiny entities
+dfn2["perc"] = dfn2["blocks_low"] / (dfn2["blocks_high"] + dfn2["blocks_low"])
+(dfn2.sort_values(["perc", "blocks_high", "blocks_low"], ascending=False)
      .reset_index(drop=True)
      .to_json("assets/entity_data.json", orient="values"))
 
@@ -162,9 +169,9 @@ HOVER = dict(font_size=20, font_color="white", bgcolor="black")
 
 def create_chart(mobile=False):
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=pivoted.index, y=pivoted[45_000_000], name="<=45m",
+    fig.add_trace(go.Bar(x=pivoted.index, y=pivoted[LOW], name=LOW_NAME,
                          marker_color=color_palette[0], hoverinfo="skip"))
-    fig.add_trace(go.Bar(x=pivoted.index, y=pivoted[60_000_000], name=">=60m",
+    fig.add_trace(go.Bar(x=pivoted.index, y=pivoted[HIGH], name=HIGH_NAME,
                          marker_color=color_palette[1], hovertemplate="%{y:.1f}%"))
     fig.update_layout(
         title="Gas Limit Signaling", barmode="stack", bargap=0, bargroupgap=0, **DARK,
@@ -181,7 +188,7 @@ def create_chart(mobile=False):
 def create_chart_entities(mobile=False):
     fig = go.Figure()
     for ix, label in enumerate(order):
-        _df = dfn[(dfn["label"] == label) & (dfn["execution_payload_gas_limit_adj"] == 60_000_000)]
+        _df = dfn[(dfn["label"] == label) & (dfn["execution_payload_gas_limit_adj"] == HIGH)]
         fig.add_trace(go.Bar(x=_df["date"], y=_df["slot"], name=label,
                              marker_color=color_palette[(ix + 1) % len(color_palette)],
                              hoverinfo="skip"))
@@ -197,11 +204,11 @@ def create_chart_entities(mobile=False):
 
 
 def create_chart_reg(mobile=False):
-    vals = [sum(g < 60_000_000 for g in reg.values()), sum(g >= 60_000_000 for g in reg.values())]
+    vals = [sum(g < THRESHOLD for g in reg.values()), sum(g >= THRESHOLD for g in reg.values())]
     grid = dict(showgrid=True, gridcolor="lightgrey", gridwidth=0.1,
                 zeroline=True, zerolinecolor="grey", zerolinewidth=1)
     fig = go.Figure(go.Bar(
-        x=["45M", "60M"], y=vals,
+        x=[LOW_NAME, HIGH_NAME], y=vals,
         marker=dict(color=color_palette[:2], line=dict(color="rgb(50,50,50)", width=1.5)),
         hovertemplate="<b>%{x}</b><br>Validators: %{y}<extra></extra>",
     ))
@@ -389,7 +396,7 @@ document.addEventListener("DOMContentLoaded", function () {
                 container.addEventListener("mouseover", e => {
                     tooltip.textContent =
                         `Total number of blocks (last 7 days): ${total}\\n` +
-                        `Number of blocks that increased the gas limit: ${blocks_raised}`;
+                        `Number of blocks signaling HIGH_NAME: ${blocks_raised}`;
                     tooltip.style.display = "block";
                     move(e);
                 });
@@ -405,7 +412,7 @@ document.addEventListener("DOMContentLoaded", function () {
         .catch(err => console.error("Error fetching data:", err));
 });
 </script>
-"""
+""".replace("HIGH_NAME", HIGH_NAME)
 
 reg_table = """
 <div class="label-filter">
